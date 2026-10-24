@@ -111,46 +111,39 @@ func (w *WorkspaceWatcher) AddRegistrations(ctx context.Context, id string, watc
 		}
 	}
 
-	// Find and open all existing files that match the newly registered patterns
-	// TODO: not all language servers require this, but typescript does. Make this configurable
-	go func() {
-		startTime := time.Now()
-		filesOpened := 0
+	if os.Getenv("MCP_LSP_EAGER_OPEN_FILES") == "1" {
+		go func() {
+			startTime := time.Now()
+			filesOpened := 0
 
-		err := filepath.WalkDir(w.workspacePath, func(path string, d os.DirEntry, err error) error {
+			err := filepath.WalkDir(w.workspacePath, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if d.IsDir() {
+					if path != w.workspacePath && w.shouldExcludeDir(path) {
+						return filepath.SkipDir
+					}
+				} else {
+					w.openMatchingFile(ctx, path)
+					filesOpened++
+					if filesOpened%100 == 0 {
+						time.Sleep(10 * time.Millisecond)
+					}
+				}
+				return nil
+			})
+
+			elapsedTime := time.Since(startTime)
+			watcherLogger.Info("Workspace scan complete: processed %d files in %.2f seconds",
+				filesOpened, elapsedTime.Seconds())
+
 			if err != nil {
-				return err
+				watcherLogger.Error("Error scanning workspace for files to open: %v", err)
 			}
-
-			// Skip directories that should be excluded
-			if d.IsDir() {
-				watcherLogger.Debug("Processing directory: %s", path)
-				if path != w.workspacePath && w.shouldExcludeDir(path) {
-					watcherLogger.Debug("Skipping excluded directory: %s", path)
-					return filepath.SkipDir
-				}
-			} else {
-				// Process files
-				w.openMatchingFile(ctx, path)
-				filesOpened++
-
-				// Add a small delay after every 100 files to prevent overwhelming the server
-				if filesOpened%100 == 0 {
-					time.Sleep(10 * time.Millisecond)
-				}
-			}
-
-			return nil
-		})
-
-		elapsedTime := time.Since(startTime)
-		watcherLogger.Info("Workspace scan complete: processed %d files in %.2f seconds",
-			filesOpened, elapsedTime.Seconds())
-
-		if err != nil {
-			watcherLogger.Error("Error scanning workspace for files to open: %v", err)
-		}
-	}()
+		}()
+	}
 }
 
 // WatchWorkspace sets up file watching for a workspace

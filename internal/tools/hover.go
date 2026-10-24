@@ -11,11 +11,11 @@ import (
 
 // GetHoverInfo retrieves hover information (type, documentation) for a symbol at the specified position
 func GetHoverInfo(ctx context.Context, client *lsp.Client, filePath string, line, column int) (string, error) {
-	// Open the file if not already open
-	err := client.OpenFile(ctx, filePath)
+	canonicalPath, restore, err := client.OverlayWorktree(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("could not open file: %v", err)
 	}
+	defer restore()
 
 	params := protocol.HoverParams{}
 
@@ -24,7 +24,7 @@ func GetHoverInfo(ctx context.Context, client *lsp.Client, filePath string, line
 		Line:      uint32(line - 1),
 		Character: uint32(column - 1),
 	}
-	uri := protocol.DocumentUri("file://" + filePath)
+	uri := protocol.DocumentUri("file://" + canonicalPath)
 	params.TextDocument = protocol.TextDocumentIdentifier{
 		URI: uri,
 	}

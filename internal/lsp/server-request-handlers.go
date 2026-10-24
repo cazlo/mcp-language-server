@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"os"
 
 	"github.com/isaacphi/mcp-language-server/internal/protocol"
 	"github.com/isaacphi/mcp-language-server/internal/utilities"
@@ -21,7 +22,33 @@ func RegisterFileWatchHandler(handler FileWatchHandler) {
 // Requests
 
 func HandleWorkspaceConfiguration(params json.RawMessage) (any, error) {
-	return []map[string]any{{}}, nil
+	var configParams protocol.ConfigurationParams
+	_ = json.Unmarshal(params, &configParams)
+	count := len(configParams.Items)
+	if count == 0 {
+		count = 1
+	}
+
+	var custom map[string]any
+	if raw := os.Getenv("MCP_LSP_INIT_OPTIONS"); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &custom)
+	}
+
+	results := make([]any, count)
+	for i := 0; i < count; i++ {
+		if custom == nil {
+			results[i] = map[string]any{}
+			continue
+		}
+		if i < len(configParams.Items) && configParams.Items[i].Section != "" {
+			if sectionVal, ok := custom[configParams.Items[i].Section]; ok {
+				results[i] = sectionVal
+				continue
+			}
+		}
+		results[i] = custom
+	}
+	return results, nil
 }
 
 func HandleRegisterCapability(params json.RawMessage) (any, error) {

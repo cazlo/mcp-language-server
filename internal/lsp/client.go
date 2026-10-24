@@ -44,6 +44,9 @@ type Client struct {
 	// Files are currently opened by the LSP
 	openFiles   map[string]*OpenFileInfo
 	openFilesMu sync.RWMutex
+
+	// Serializes temporary worktree overlays onto canonical workspace URIs
+	worktreeOverlayMu sync.Mutex
 }
 
 func NewClient(command string, args ...string) (*Client, error) {
@@ -177,17 +180,7 @@ func (c *Client) InitializeLSPClient(ctx context.Context, workspaceDir string) (
 				},
 				Window: protocol.WindowClientCapabilities{},
 			},
-			InitializationOptions: map[string]any{
-				"codelenses": map[string]bool{
-					"generate":           true,
-					"regenerate_cgo":     true,
-					"test":               true,
-					"tidy":               true,
-					"upgrade_dependency": true,
-					"vendor":             true,
-					"vulncheck":          false,
-				},
-			},
+			InitializationOptions: defaultInitializationOptions(),
 		},
 	}
 
@@ -286,31 +279,83 @@ type OpenFileInfo struct {
 	URI     protocol.DocumentUri
 }
 
-func (c *Client) OpenFile(ctx context.Context, filepath string) error {
-	uri := fmt.Sprintf("file://%s", filepath)
+func defaultInitializationOptions() any {
+	if raw := os.Getenv("MCP_LSP_INIT_OPTIONS"); raw != "" {
+		var parsed any
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+			return parsed
+		}
+		lspLogger.Warn("Failed to parse MCP_LSP_INIT_OPTIONS JSON, falling back to defaults")
+	}
+	return map[string]any{
+		"codelenses": map[string]bool{
+			"generate":           true,
+			"regenerate_cgo":     true,
+			"test":               true,
+			"tidy":               true,
+			"upgrade_dependency": true,
+			"vendor":             true,
+			"vulncheck":          false,
+		},
+	}
+}
+
+func MapWorktreePath(filePath string) (canonicalPath, wtRoot, repoRoot string, isWorktree bool) {
+	const marker = "/.worktrees/"
+	idx := strings.Index(filePath, marker)
+	if idx < 0 {
+		return filePath, "", "", false
+	}
+	repoRoot = filePath[:idx]
+	rest := filePath[idx+len(marker):]
+	slashIdx := strings.IndexByte(rest, '/')
+	if slashIdx <= 0 {
+		return filePath, "", "", false
+	}
+	wtName := rest[:slashIdx]
+	relPath := rest[slashIdx+1:]
+	wtRoot = repoRoot + marker + wtName
+	canonicalPath = repoRoot + "/" + relPath
+	return canonicalPath, wtRoot, repoRoot, true
+}
+
+func (c *Client) OpenOrUpdateWithContent(ctx context.Context, targetPath string, content string) error {
+	uri := fmt.Sprintf("file://%s", targetPath)
 
 	c.openFilesMu.Lock()
-	if _, exists := c.openFiles[uri]; exists {
+	fileInfo, isOpen := c.openFiles[uri]
+	if isOpen {
+		fileInfo.Version++
+		version := fileInfo.Version
 		c.openFilesMu.Unlock()
-		return nil // Already open
+
+		params := protocol.DidChangeTextDocumentParams{
+			TextDocument: protocol.VersionedTextDocumentIdentifier{
+				TextDocumentIdentifier: protocol.TextDocumentIdentifier{
+					URI: protocol.DocumentUri(uri),
+				},
+				Version: version,
+			},
+			ContentChanges: []protocol.TextDocumentContentChangeEvent{
+				{
+					Value: protocol.TextDocumentContentChangeWholeDocument{
+						Text: content,
+					},
+				},
+			},
+		}
+		return c.Notify(ctx, "textDocument/didChange", params)
 	}
 	c.openFilesMu.Unlock()
-
-	// Skip files that do not exist or cannot be read
-	content, err := os.ReadFile(filepath)
-	if err != nil {
-		return fmt.Errorf("error reading file: %w", err)
-	}
 
 	params := protocol.DidOpenTextDocumentParams{
 		TextDocument: protocol.TextDocumentItem{
 			URI:        protocol.DocumentUri(uri),
 			LanguageID: DetectLanguageID(uri),
 			Version:    1,
-			Text:       string(content),
+			Text:       content,
 		},
 	}
-
 	if err := c.Notify(ctx, "textDocument/didOpen", params); err != nil {
 		return err
 	}
@@ -321,10 +366,87 @@ func (c *Client) OpenFile(ctx context.Context, filepath string) error {
 		URI:     protocol.DocumentUri(uri),
 	}
 	c.openFilesMu.Unlock()
-
-	lspLogger.Debug("Opened file: %s", filepath)
-
 	return nil
+}
+
+func (c *Client) OverlayWorktree(ctx context.Context, filePath string) (string, func(), error) {
+	canonicalPath, wtRoot, repoRoot, isWorktree := MapWorktreePath(filePath)
+	if !isWorktree {
+		if err := c.OpenFile(ctx, filePath); err != nil {
+			return "", func() {}, err
+		}
+		return filePath, func() {}, nil
+	}
+
+	c.worktreeOverlayMu.Lock()
+
+	type pair struct {
+		wtFile    string
+		canonFile string
+	}
+	seen := make(map[string]bool)
+	var pairs []pair
+
+	addPair := func(wtFile, canonFile string) {
+		if !seen[canonFile] {
+			seen[canonFile] = true
+			pairs = append(pairs, pair{wtFile: wtFile, canonFile: canonFile})
+		}
+	}
+	addPair(filePath, canonicalPath)
+
+	if out, err := exec.Command("/usr/bin/git", "-C", wtRoot, "status", "--porcelain", "-uall").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if len(line) < 4 {
+				continue
+			}
+			rel := strings.TrimSpace(line[3:])
+			if idx := strings.Index(rel, " -> "); idx >= 0 {
+				rel = rel[idx+4:]
+			}
+			if strings.HasSuffix(rel, ".rs") || strings.HasSuffix(rel, ".cs") {
+				addPair(wtRoot+"/"+rel, repoRoot+"/"+rel)
+			}
+		}
+	}
+
+	for _, p := range pairs {
+		content, err := os.ReadFile(p.wtFile)
+		if err != nil {
+			if p.wtFile == filePath {
+				c.worktreeOverlayMu.Unlock()
+				return "", func() {}, fmt.Errorf("error reading worktree file: %w", err)
+			}
+			continue
+		}
+		if err := c.OpenOrUpdateWithContent(ctx, p.canonFile, string(content)); err != nil && p.wtFile == filePath {
+			c.worktreeOverlayMu.Unlock()
+			return "", func() {}, err
+		}
+	}
+
+	restore := func() {
+		defer c.worktreeOverlayMu.Unlock()
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for _, p := range pairs {
+			if mainBytes, err := os.ReadFile(p.canonFile); err == nil {
+				_ = c.OpenOrUpdateWithContent(restoreCtx, p.canonFile, string(mainBytes))
+			} else {
+				_ = c.CloseFile(restoreCtx, p.canonFile)
+			}
+		}
+	}
+
+	return canonicalPath, restore, nil
+}
+
+func (c *Client) OpenFile(ctx context.Context, filepath string) error {
+	content, err := os.ReadFile(filepath)
+	if err != nil {
+		return fmt.Errorf("error reading file: %w", err)
+	}
+	return c.OpenOrUpdateWithContent(ctx, filepath, string(content))
 }
 
 func (c *Client) NotifyChange(ctx context.Context, filepath string) error {

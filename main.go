@@ -156,7 +156,7 @@ func main() {
 			select {
 			case <-ticker.C:
 				currentPpid := os.Getppid()
-				if currentPpid != ppid && (currentPpid == 1 || ppid == 1) {
+				if currentPpid != ppid {
 					coreLogger.Info("Parent process %d terminated (current ppid: %d), initiating shutdown", ppid, currentPpid)
 					close(parentDeath)
 					return
@@ -185,6 +185,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	cleanup(server, done)
 	<-done
 	coreLogger.Info("Server shutdown complete for PID: %d", os.Getpid())
 	os.Exit(0)

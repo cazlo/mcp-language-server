@@ -21,29 +21,44 @@ func GetDiagnosticsForFile(ctx context.Context, client *lsp.Client, filePath str
 		}
 	}
 
-	err := client.OpenFile(ctx, filePath)
+	canonicalPath, restore, err := client.OverlayWorktree(ctx, filePath)
 	if err != nil {
 		return "", fmt.Errorf("could not open file: %v", err)
 	}
+	defer restore()
 
-	// Wait for diagnostics
-	// TODO: wait for notification
-	time.Sleep(time.Second * 3)
-
-	// Convert the file path to URI format
-	uri := protocol.DocumentUri("file://" + filePath)
-
-	// Request fresh diagnostics
+	// Convert the canonical workspace path to URI format for the LSP query
+	uri := protocol.DocumentUri("file://" + canonicalPath)
 	diagParams := protocol.DocumentDiagnosticParams{
 		TextDocument: protocol.TextDocumentIdentifier{URI: uri},
 	}
-	_, err = client.Diagnostic(ctx, diagParams)
-	if err != nil {
-		toolsLogger.Error("Failed to get diagnostics: %v", err)
-	}
 
-	// Get diagnostics from the cache
-	diagnostics := client.GetFileDiagnostics(uri)
+	var diagnostics []protocol.Diagnostic
+	for attempt := 0; attempt < 4; attempt++ {
+		time.Sleep(time.Second * 1)
+		report, diagErr := client.Diagnostic(ctx, diagParams)
+		if diagErr != nil {
+			toolsLogger.Error("Failed to get diagnostics: %v", diagErr)
+		}
+
+		rawDiags := client.GetFileDiagnostics(uri)
+		if len(rawDiags) == 0 {
+			if full, ok := report.Value.(protocol.RelatedFullDocumentDiagnosticReport); ok {
+				rawDiags = full.Items
+			}
+		}
+
+		diagnostics = nil
+		for _, d := range rawDiags {
+			if d.Severity == protocol.SeverityHint {
+				continue
+			}
+			diagnostics = append(diagnostics, d)
+		}
+		if len(diagnostics) > 0 || (diagErr == nil && attempt >= 1) {
+			break
+		}
+	}
 
 	if len(diagnostics) == 0 {
 		return "No diagnostics found for " + filePath, nil
