@@ -42,6 +42,16 @@ func WriteMessage(w io.Writer, msg *Message) error {
 	return nil
 }
 
+// writeMessage serializes writes to the server's stdin. WriteMessage emits the
+// header and body as separate writes, so concurrent callers (tool requests,
+// watcher notifications, replies to server requests) would otherwise
+// interleave them and the server would abort on a malformed payload.
+func (c *Client) writeMessage(msg *Message) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return WriteMessage(c.stdin, msg)
+}
+
 // ReadMessage reads a single LSP message from the given reader
 func ReadMessage(r *bufio.Reader) (*Message, error) {
 	// Read headers
@@ -150,7 +160,7 @@ func (c *Client) handleMessages() {
 			}
 
 			// Send response back to server
-			if err := WriteMessage(c.stdin, response); err != nil {
+			if err := c.writeMessage(response); err != nil {
 				lspLogger.Error("Error sending response to server: %v", err)
 			}
 
@@ -217,7 +227,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 	}()
 
 	// Send request
-	if err := WriteMessage(c.stdin, msg); err != nil {
+	if err := c.writeMessage(msg); err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
@@ -258,7 +268,7 @@ func (c *Client) Notify(ctx context.Context, method string, params any) error {
 		return fmt.Errorf("failed to create notification: %w", err)
 	}
 
-	if err := WriteMessage(c.stdin, msg); err != nil {
+	if err := c.writeMessage(msg); err != nil {
 		return fmt.Errorf("failed to send notification: %w", err)
 	}
 
